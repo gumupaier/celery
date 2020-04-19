@@ -105,9 +105,9 @@ class CallableSignature(CallableTask):  # pragma: no cover
     def subtask_type(self):
         pass
 
-    @abstractproperty
-    def chord_size(self):
-        pass
+    # @abstractproperty
+    # def chord_size(self):
+    #     pass
 
     @abstractproperty
     def immutable(self):

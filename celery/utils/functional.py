@@ -5,20 +5,22 @@ from __future__ import absolute_import, print_function, unicode_literals
 import inspect
 import sys
 from functools import partial
-from itertools import chain, islice
+from itertools import islice, tee
 
 from kombu.utils.functional import (LRUCache, dictfilter, is_list, lazy,
                                     maybe_evaluate, maybe_list, memoize)
 from vine import promise
 
-from celery.five import UserList, getfullargspec, range
+from celery.five import UserList, getfullargspec, range, zip_longest
 
 __all__ = (
     'LRUCache', 'is_list', 'maybe_list', 'memoize', 'mlazy', 'noop',
     'first', 'firstmethod', 'chunks', 'padlist', 'mattrgetter', 'uniq',
-    'regen', 'dictfilter', 'lazy', 'maybe_evaluate', 'head_from_fun',
-    'maybe', 'fun_accepts_kwargs',
+    'lookahead', 'regen', 'dictfilter', 'lazy', 'maybe_evaluate',
+    'head_from_fun', 'maybe', 'fun_accepts_kwargs',
 )
+
+IS_PY3 = sys.version_info[0] == 3
 
 FUNHEAD_TEMPLATE = """
 def {fun_name}({fun_args}):
@@ -37,7 +39,6 @@ class DummyContext(object):
 
 class mlazy(lazy):
     """Memoized lazy evaluation.
-
     The function is only evaluated once, every subsequent access
     will return the same value.
     """
@@ -55,9 +56,9 @@ class mlazy(lazy):
 
 def noop(*args, **kwargs):
     """No operation.
-
     Takes any arguments/keyword arguments and does nothing.
     """
+    pass
 
 
 def pass1(arg, *args, **kwargs):
@@ -74,7 +75,6 @@ def evaluate_promises(it):
 
 def first(predicate, it):
     """Return the first element in ``it`` that ``predicate`` accepts.
-
     If ``predicate`` is None it will return the first item that's not
     :const:`None`.
     """
@@ -87,10 +87,8 @@ def first(predicate, it):
 
 def firstmethod(method, on_call=None):
     """Multiple dispatch.
-
     Return a function that with a list of instances,
     finds the first instance that gives a value for the given method.
-
     The list can also contain lazy instances
     (:class:`~kombu.utils.functional.lazy`.)
     """
@@ -110,20 +108,16 @@ def firstmethod(method, on_call=None):
 
 def chunks(it, n):
     """Split an iterator into chunks with `n` elements each.
-
     Warning:
         ``it`` must be an actual iterator, if you pass this a
         concrete sequence will get you repeating elements.
-
         So ``chunks(iter(range(1000)), 10)`` is fine, but
         ``chunks(range(1000), 10)`` is not.
-
     Example:
         # n == 2
         >>> x = chunks(iter([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), 2)
         >>> list(x)
         [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9], [10]]
-
         # n == 3
         >>> x = chunks(iter([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]), 3)
         >>> list(x)
@@ -135,7 +129,6 @@ def chunks(it, n):
 
 def padlist(container, size, default=None):
     """Pad list with default elements.
-
     Example:
         >>> first, last, city = padlist(['George', 'Costanza', 'NYC'], 3)
         ('George', 'Costanza', 'NYC')
@@ -151,7 +144,6 @@ def padlist(container, size, default=None):
 
 def mattrgetter(*attrs):
     """Get attributes, ignoring attribute errors.
-
     Like :func:`operator.itemgetter` but return :const:`None` on missing
     attributes instead of raising :exc:`AttributeError`.
     """
@@ -164,9 +156,20 @@ def uniq(it):
     return (seen.add(obj) or obj for obj in it if obj not in seen)
 
 
+def lookahead(it):
+    """Yield pairs of (current, next) items in `it`.
+    `next` is None if `current` is the last item.
+    Example:
+        >>> list(lookahead(x for x in range(6)))
+        [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, None)]
+    """
+    a, b = tee(it)
+    next(b, None)
+    return zip_longest(a, b, fillvalue=None)
+
+
 def regen(it):
     """Convert iterator to an object that can be consumed multiple times.
-
     ``Regen`` takes any iterable, and if the object is an
     generator it will cache the evaluated list on first access,
     so that the generator can be "consumed" multiple times.
@@ -186,6 +189,7 @@ class _regen(UserList, list):
         self.__it = it
         self.__index = 0
         self.__consumed = []
+        self.__done = False
 
     def __reduce__(self):
         return list, (self.data,)
@@ -193,8 +197,23 @@ class _regen(UserList, list):
     def __length_hint__(self):
         return self.__it.__length_hint__()
 
+    def __repr__(self):
+        # override list.__repr__ to avoid consuming the generator
+        if self.__done:
+            return repr(self.__consumed)
+        else:
+            return '[{0}]'.format(', '.join(
+                [repr(x) for x in self.__consumed] + ['...'])
+            )
+
     def __iter__(self):
-        return chain(self.__consumed, self.__it)
+        for x in self.__consumed:
+            yield x
+        if not self.__done:
+            for y in self.__it:
+                self.__consumed.append(y)
+                yield y
+            self.__done = True
 
     def __getitem__(self, index):
         if index < 0:
@@ -202,21 +221,40 @@ class _regen(UserList, list):
         try:
             return self.__consumed[index]
         except IndexError:
+            it = iter(self)
             try:
                 for _ in range(self.__index, index + 1):
-                    self.__consumed.append(next(self.__it))
+                    next(it)
             except StopIteration:
                 raise IndexError(index)
             else:
                 return self.__consumed[index]
 
+    def __nonzero__(self):
+        # nonzero for list calls len() which would consume the generator:
+        # override to consume maximum of one item.
+        if len(self.__consumed):
+            return True
+        try:
+            next(iter(self))
+        except StopIteration:
+            return False
+        else:
+            return True
+
+    # Python3
+
+    __bool__ = __nonzero__
+
     @property
     def data(self):
-        try:
-            self.__consumed.extend(list(self.__it))
-        except StopIteration:
-            pass
+        # consume the generator
+        list(iter(self))
         return self.__consumed
+
+    def fully_consumed(self):
+        """Return whether the iterator has been fully consumed"""
+        return self.__done
 
 
 def _argsfromspec(spec, replace_defaults=True):
@@ -262,10 +300,9 @@ def head_from_fun(fun, bound=False, debug=False):
     # as just calling a function.
     is_function = inspect.isfunction(fun)
     is_callable = hasattr(fun, '__call__')
-    is_cython = fun.__class__.__name__ == 'cython_function_or_method'
     is_method = inspect.ismethod(fun)
 
-    if not is_function and is_callable and not is_method and not is_cython:
+    if not is_function and is_callable and not is_method:
         name, fun = fun.__class__.__name__, fun.__call__
     else:
         name = fun.__name__
@@ -327,7 +364,6 @@ def maybe(typ, val):
 
 def seq_concat_item(seq, item):
     """Return copy of sequence seq with item added.
-
     Returns:
         Sequence: if seq is a tuple, the result will be a tuple,
            otherwise it depends on the implementation of ``__add__``.
@@ -337,7 +373,6 @@ def seq_concat_item(seq, item):
 
 def seq_concat_seq(a, b):
     """Concatenate two sequences: ``a + b``.
-
     Returns:
         Sequence: The return value will depend on the largest sequence
             - if b is larger and is a tuple, the return value will be a tuple.
